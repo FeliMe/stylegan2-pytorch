@@ -45,7 +45,11 @@ You should change your size (--size 256 for example) if you train with another d
 
 ### Project images to latent spaces
 
-> python projector.py --ckpt [CHECKPOINT] --size [GENERATOR_OUTPUT_SIZE] FILE1 FILE2 ...
+> python project_images.py SRC_FILE/SCR_DIR TARGET_DIR
+
+### Interpolate between latent spaces
+
+> python interpolate PATH_LATENT1 PATH_LATENT2 TARGET_DIR
 
 ## Samples
 
