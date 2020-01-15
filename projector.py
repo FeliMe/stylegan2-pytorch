@@ -1,180 +1,160 @@
-import argparse
-import math
-import os
-
+import numpy as np
 import torch
-from torch import optim
-from torch.nn import functional as F
-from torchvision import transforms
-from PIL import Image
+
+from lpips import PerceptualLoss
 from tqdm import tqdm
 
-import lpips
-from model import Generator
 
+class Projector:
+    def __init__(self,
+                 g,
+                 num_steps=1000,
+                 initial_learning_rate=0.1,
+                 initial_noise_factor=0.05,
+                 verbose=True
+                 ):
 
-def noise_regularize(noises):
-    loss = 0
-    
-    for noise in noises:
-        size = noise.shape[2]
-        
-        while True:
-            loss = loss + (noise * torch.roll(noise, shifts=1, dims=3)).mean().pow(2) \
-                        + (noise * torch.roll(noise, shifts=1, dims=2)).mean().pow(2)
-            
-            if size <= 8:
-                break
-                
-            noise = noise.reshape([1, 1, size // 2, 2, size // 2, 2])
-            noise = noise.mean([3, 5])
-            size //= 2
-            
-    return loss
+        self.num_steps = num_steps
+        self.n_mean_latent = 10000
+        self.initial_lr = initial_learning_rate
+        self.initial_noise_factor = initial_noise_factor
+        self.lr_rampdown_length = 0.25
+        self.lr_rampup_length = 0.05
+        self.noise_ramp_length = 0.75
+        self.regularize_noise_weight = 1e5
+        self.verbose = verbose
 
+        self.latent_expr = None
+        self.lpips = None
+        self.target_images = None
+        self.imag_gen = None
+        self.loss = None
+        self.lr = None
+        self.cur_step = None
 
-def noise_normalize_(noises):
-    for noise in noises:
-        mean = noise.mean()
-        std = noise.std()
-        
-        noise.data.add_(-mean).div_(std)
-        
-        
-def get_lr(t, initial_lr, rampdown=0.25, rampup=0.05):
-    lr_ramp = min(1, (1 - t) / rampdown)
-    lr_ramp = 0.5 - 0.5 * math.cos(lr_ramp * math.pi)
-    lr_ramp = lr_ramp * min(1, t / rampup)
-    
-    return initial_lr * lr_ramp
+        self.g_ema = g
+        self.device = next(g.parameters()).device
 
+        # Find latent stats
+        self._info(('Finding W midpoint and stddev using %d samples...' % self.n_mean_latent))
+        torch.manual_seed(123)
+        with torch.no_grad():
+            noise_sample = torch.randn(
+                self.n_mean_latent, 512, device=self.device)
+            latent_out = self.g_ema.style(noise_sample)
 
-def latent_noise(latent, strength):
-    noise = torch.randn_like(latent) * strength
-    
-    return latent + noise
+        self.latent_mean = latent_out.mean(0)
+        self.latent_std = ((latent_out - self.latent_mean).pow(2).sum() /
+                            self.n_mean_latent) ** 0.5
+        self._info('std = {}'.format(self.latent_std))
 
+        self.latent_in = self.latent_mean.detach().clone().unsqueeze(0)
+        self.latent_in = self.latent_in.repeat(self.g_ema.n_latent, 1)
+        self.latent_in.requires_grad = True
 
-def make_image(tensor):
-    return tensor.detach().clamp_(min=-1, max=1).add(1).div_(2).mul(255) \
-                .type(torch.uint8).permute(0, 2, 3, 1).to('cpu').numpy()
+        # Find noise inputs.
+        self.noises = [noise.to(self.device) for noise in g.noises]
 
+        # Init optimizer
+        self.opt = torch.optim.Adam(
+            [self.latent_in] + self.noises, lr=self.initial_lr)
 
-if __name__ == '__main__':
-    device = 'cuda'
-    
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--ckpt', type=str, required=True)
-    parser.add_argument('--size', type=int, default=256)
-    parser.add_argument('--lr_rampup', type=float, default=0.05)
-    parser.add_argument('--lr_rampdown', type=float, default=0.25)
-    parser.add_argument('--lr', type=float, default=0.1)
-    parser.add_argument('--noise', type=float, default=0.05)
-    parser.add_argument('--noise_ramp', type=float, default=0.75)
-    parser.add_argument('--step', type=int, default=1000)
-    parser.add_argument('--noise_regularize', type=float, default=1e5)
-    parser.add_argument('--mse', type=float, default=0)
-    parser.add_argument('--w_plus', action='store_true')
-    parser.add_argument('files', metavar='FILES', nargs='+')
-    
-    args = parser.parse_args()
-    
-    n_mean_latent = 10000
-    
-    resize = min(args.size, 256)
-    
-    transform = transforms.Compose([transforms.Resize(resize),
-                               transforms.CenterCrop(resize),
-                               transforms.ToTensor(),
-                               transforms.Normalize([0.5, 0.5, 0.5],
-                                                   [0.5, 0.5, 0.5])])
-    
-    imgs = []
-    
-    for imgfile in args.files:
-        img = transform(Image.open(imgfile).convert('RGB'))
-        imgs.append(img)
-        
-    imgs = torch.stack(imgs, 0).to(device)
-    
-    g_ema = Generator(args.size, 512, 8)
-    g_ema.load_state_dict(torch.load(args.ckpt)['g_ema'])
-    g_ema.eval()
-    g_ema = g_ema.to(device)
-    
-    with torch.no_grad():
-        noise_sample = torch.randn(n_mean_latent, 512, device=device)
-        latent_out = g_ema.style(noise_sample)
-        
-        latent_mean = latent_out.mean(0)
-        latent_std = ((latent_out - latent_mean).pow(2).sum() / n_mean_latent) ** 0.5
-    
-    percept = lpips.PerceptualLoss(model='net-lin', net='vgg', use_gpu=device.startswith('cuda'))
-    
-    noises = g_ema.make_noise()
-    
-    latent_in = latent_mean.detach().clone().unsqueeze(0).repeat(2, 1)
-    
-    if args.w_plus:
-        latent_in.unsqueeze(1).repeat(1, g_ema.n_latent, 1)
+        # Init loss function
+        self.lpips = PerceptualLoss(model='net-lin', net='vgg').to(self.device)
 
-    latent_in.requires_grad = True
-    
-    for noise in noises:
-        noise.requires_grad = True
-        
-    optimizer = optim.Adam([latent_in] + noises, lr=args.lr)
-    
-    pbar = tqdm(range(args.step))
-    latent_path = []
-    
-    for i in pbar:
-        t = i / args.step
-        lr = get_lr(t, args.lr)
-        optimizer.param_groups[0]['lr'] = lr
-        noise_strength = latent_std * args.noise * max(0, 1 - t / args.noise_ramp) ** 2
-        latent_n = latent_noise(latent_in, noise_strength.item())
-        
-        img_gen, _ = g_ema([latent_n], input_is_latent=True, noise=noises)
-        
-        batch, channel, height, width = img_gen.shape
-        
-        if height > 256:
-            factor = height // 256
-            
-            img_gen = img_gen.reshape(batch, channel, height // factor, factor, width // factor, factor)
-            img_gen = img_gen.mean([3, 5])
-        
-        p_loss = percept(img_gen, imgs).sum()
-        n_loss = noise_regularize(noises)
-        mse_loss = F.mse_loss(img_gen, imgs)
-        
-        loss = p_loss + args.noise_regularize * n_loss + args.mse * mse_loss
-            
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        
-        noise_normalize_(noises)
-        
-        if (i + 1) % 100 == 0:
-            latent_path.append(latent_in.detach().clone())
-            
-        pbar.set_description((f'perceptual: {p_loss.item():.4f}; noise regularize: {n_loss.item():.4f};'
-                             f' mse: {mse_loss.item():.4f}; lr: {lr:.4f}'))
-        
-    result_file = {'noises': noises}
-    
-    img_gen, _ = g_ema([latent_path[-1]], input_is_latent=True, noise=noises)
-    
-    filename = os.path.splitext(os.path.basename(args.files[0]))[0] + '.pt'
-    
-    img_ar = make_image(img_gen)
-    
-    for i, input_name in enumerate(args.files):
-        result_file[input_name] = {'img': img_gen[i], 'latent': latent_in[i]}
-        img_name = os.path.splitext(os.path.basename(input_name))[0] + '-project.png'
-        pil_img = Image.fromarray(img_ar[i])
-        pil_img.save(img_name)
-        
-    torch.save(result_file, filename)
+    def _info(self, *args):
+        if self.verbose:
+            print('Projector:', *args)
+
+    def update_lr(self, t):
+        lr_ramp = min(1.0, (1.0 - t) / self.lr_rampdown_length)
+        lr_ramp = 0.5 - 0.5 * np.cos(lr_ramp * np.pi)
+        lr_ramp = lr_ramp * min(1.0, t / self.lr_rampup_length)
+        self.lr = self.initial_lr * lr_ramp
+        self.opt.param_groups[0]['lr'] = self.lr
+
+    def noise_regularization(self):
+        reg_loss = 0.0
+        for noise in self.noises:
+            size = noise.shape[2]
+            while True:
+                reg_loss += (noise * noise.roll(1, dims=3)).mean().pow(2) + \
+                    (noise * noise.roll(1, dims=2)).mean().pow(2)
+                if size <= 8:
+                    break  # Small enough already
+                noise = noise.reshape(
+                    [1, 1, size // 2, 2, size // 2, 2])  # Downscale
+                noise = noise.mean(dim=[3, 5])
+                size = size // 2
+        return reg_loss
+
+    def normalize_noise(self):
+        for noise in self.noises:
+            mean = noise.mean()
+            std = noise.std()
+            noise.data.add_(-mean).div_(std)
+
+    def prepare_input(self, target_images):
+        if len(target_images.shape) == 3:
+            target_images = target_images.unsqueeze(0)
+        if target_images.shape[2] > 256:
+            target_images = self.downsample_img(target_images)
+        self.target_images = target_images
+        print(self.target_images.shape)
+
+    def downsample_img(self, img):
+        b, c, h, w = img.shape
+        factor = h // 256
+        img = img.reshape(b, c, h // factor, factor, w // factor, factor)
+        img = img.mean([3, 5])
+        return img
+
+    def run(self, target_images):
+        self.prepare_input(target_images)
+
+        self._info('Running...')
+        pbar = tqdm(range(self.num_steps))
+        for i_step in pbar:
+            self.cur_step = i_step
+            self.step()
+            pbar.set_description((f'loss: {self.loss.item():.4f}; lr: {self.lr:.4f}'))
+
+    def step(self):
+        # Hyperparameters
+        t = self.cur_step / self.num_steps
+
+        # Add noise to dlatents
+        noise_strength = self.latent_std * self.initial_noise_factor * \
+            max(0.0, 1.0 - t / self.noise_ramp_length) ** 2
+        latent_noise = (torch.randn_like(self.latent_in)
+                        * noise_strength).to(self.device)
+        self.latent_expr = self.latent_in + latent_noise
+
+        # Update learning rate
+        self.update_lr(t)
+
+        # Train
+        self.img_gen, _ = self.g_ema([self.latent_expr], input_is_latent=True, noise=self.noises)
+        if self.img_gen.shape[2] > 256:
+            self.imag_gen = self.downsample_img(self.img_gen)
+
+        self.loss = self.lpips(self.imag_gen, self.target_images).sum()
+
+        # Noise regularization
+        reg_loss = self.noise_regularization()
+        self.loss += reg_loss * self.regularize_noise_weight
+
+        # Update params
+        self.opt.zero_grad()
+        self.loss.backward()
+        self.opt.step()
+
+        # Normalize noise
+        self.normalize_noise()
+
+    def get_images(self):
+        imgs, _ = self.g_ema([self.latent_in], input_is_latent=True, noise=self.noises)
+        return imgs
+
+    def get_latents(self):
+        return self.latent_in

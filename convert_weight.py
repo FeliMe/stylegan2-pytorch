@@ -41,19 +41,19 @@ def convert_modconv(vars, source_name, target_name, flip=False):
 
 def convert_conv(vars, source_name, target_name, bias=True, start=0):
     weight = vars[source_name + '/weight'].value().eval()
-    
+
     dic = {'weight': weight.transpose((3, 2, 0, 1))}
-    
+
     if bias:
         dic['bias'] = vars[source_name + '/bias'].value().eval()
-    
+
     dic_torch = {}
-    
+
     dic_torch[target_name + f'.{start}.weight'] = torch.from_numpy(dic['weight'])
-    
+
     if bias:
         dic_torch[target_name + f'.{start + 1}.bias'] = torch.from_numpy(dic['bias'])
-        
+  
     return dic_torch
 
 
@@ -101,11 +101,11 @@ def update(state_dict, new):
             raise ValueError(f'Shape mismatch: {v.shape} vs {state_dict[k].shape}')
 
         state_dict[k] = v
-        
-        
+
+
 def discriminator_fill_statedict(statedict, vars, size):
     log_size = int(math.log(size, 2))
-    
+
     update(statedict, convert_conv(vars, f'{size}x{size}/FromRGB', 'convs.0'))
 
     conv_i = 1
@@ -116,11 +116,11 @@ def discriminator_fill_statedict(statedict, vars, size):
         update(statedict, convert_conv(vars, f'{reso}x{reso}/Conv1_down', f'convs.{conv_i}.conv2', start=1))
         update(statedict, convert_conv(vars, f'{reso}x{reso}/Skip', f'convs.{conv_i}.skip', start=1, bias=False))
         conv_i += 1
-        
+
     update(statedict, convert_conv(vars, f'4x4/Conv', 'final_conv'))
     update(statedict, convert_dense(vars, f'4x4/Dense0', 'final_linear.0'))
     update(statedict, convert_dense(vars, f'Output', 'final_linear.1'))
-    
+
     return statedict
 
 
@@ -203,15 +203,26 @@ if __name__ == '__main__':
     g.load_state_dict(state_dict)
 
     latent_avg = torch.from_numpy(g_ema.vars['dlatent_avg'].value().eval())
-    
-    ckpt = {'g_ema': state_dict, 'latent_avg': latent_avg}
-    
+
+    # Load noises
+    i_key = 0
+    noises = []
+    while True:
+        key = 'G_synthesis/noise%d' % i_key
+        if key not in g_ema.vars.keys():
+            break
+        i_key += 1
+        noise = torch.from_numpy(g_ema.vars[key].value().eval())
+        noises.append(noise)
+
+    ckpt = {'g_ema': state_dict, 'latent_avg': latent_avg, 'noises': noises}
+
     if args.gen:
         g_train = Generator(size, 512, 8)
         g_train_state = g_train.state_dict()
         g_train_state = fill_statedict(g_train_state, generator.vars, size)
         ckpt['g'] = g_train_state
-        
+
     if args.disc:
         disc = Discriminator(size)
         d_state = disc.state_dict()

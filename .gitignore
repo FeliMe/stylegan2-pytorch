@@ -131,3 +131,11 @@ dmypy.json
 wandb/
 *.lmdb/
 *.pkl
+
+# Projection and interpolation folders
+/src_images/
+/generated_images/
+/latent_interpolation/
+
+# VS Code
+/.vscode/
